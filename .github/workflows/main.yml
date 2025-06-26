@@ -1,0 +1,279 @@
+name: Main CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+
+jobs:
+  # Code quality checks
+  lint:
+    name: Lint Code
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.x'
+      
+      - name: Install pre-commit
+        run: |
+          python -m pip install --upgrade pip
+          pip install pre-commit
+      
+      - name: Run pre-commit
+        run: pre-commit run --all-files
+
+  # Spell checking
+  codespell:
+    name: Spell Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.x'
+      
+      - name: Install codespell
+        run: pip install codespell
+      
+      - name: Run codespell
+        run: |
+          codespell \
+            --skip="*.git,*.svg,*.pdf,*.pyc,*~,*.min.js,*.min.css" \
+            --ignore-words-list="ba,cancelled,datas,fo,hist,nd,som,te,uint" \
+            --exclude-file=.codespellrc \
+            .
+
+  # Commit message validation
+  commit-message:
+    name: Validate Commit Messages
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Validate commit messages
+        run: |
+          # Check commit messages for basic format
+          git log --format="%s" ${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }} | \
+          while read -r msg; do
+            if [[ ${#msg} -lt 10 ]]; then
+              echo "Error: Commit message too short: '$msg'"
+              exit 1
+            fi
+          done
+
+  # Security scanning
+  scorecard:
+    name: Security Scorecard
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      
+      - name: Run analysis
+        uses: ossf/scorecard-action@v2.3.1
+        with:
+          results_file: results.sarif
+          results_format: sarif
+          publish_results: true
+      
+      - name: Upload SARIF results
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: results.sarif
+
+  # Main build job
+  build-slicer:
+    name: Build Slicer
+    runs-on: ubuntu-latest
+    needs: [lint, codespell]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+
+      # Filter paths to determine whether to proceed with the build
+      - name: Filter Paths
+        uses: dorny/paths-filter@v3.0.2
+        id: changes
+        with:
+          filters: |
+            build-relevant:
+              - ".github/actions/slicer-build/**"
+              - "Applications/**"
+              - "Base/**"
+              - "CMake/**"
+              - "Extensions/**"
+              - "Libs/**"
+              - "Modules/**"
+              - "Resources/**"
+              - "Testing/**"
+              - "CMakeLists.txt"
+              - "SuperBuild.cmake"
+
+      # Detect SuperBuild changes
+      - name: Detect SuperBuild Changes
+        uses: tj-actions/changed-files@v46.0.5
+        id: superbuild-changes
+        with:
+          files: |
+            SuperBuild/External_*
+          base_sha: nightly-main
+
+      # List changed SuperBuild files
+      - name: List Changed SuperBuild Files
+        if: steps.superbuild-changes.outputs.any_changed == 'true'
+        run: |
+          echo "Changed SuperBuild files:"
+          for file in ${ALL_CHANGED_FILES}; do
+            echo " $file"
+          done
+        env:
+          ALL_CHANGED_FILES: ${{ steps.superbuild-changes.outputs.all_changed_files }}
+
+      # Check build prerequisites
+      - name: Check Prerequisites
+        id: check-prerequisites
+        run: |
+          if [[ $SUPERBUILD_CHANGED == "true" ]]; then
+            echo "::warning ::Skipping Slicer build due to changes in SuperBuild files relative to 'nightly-main' branch."
+            echo "skip_build=true" >> $GITHUB_OUTPUT
+          elif [[ $BUILD_RELEVANT_CHANGED != "true" ]]; then
+            echo "::notice ::Skipping Slicer build - no build-relevant files changed."
+            echo "skip_build=true" >> $GITHUB_OUTPUT
+          else
+            echo "skip_build=false" >> $GITHUB_OUTPUT
+          fi
+        env:
+          SUPERBUILD_CHANGED: ${{ steps.superbuild-changes.outputs.any_changed }}
+          BUILD_RELEVANT_CHANGED: ${{ steps.changes.outputs.build-relevant }}
+
+      # Build Slicer using Docker
+      - name: Build Slicer
+        id: slicer-build
+        if: steps.check-prerequisites.outputs.skip_build == 'false'
+        run: |
+          # Set up build environment
+          docker pull slicer/slicer-base:latest
+          
+          # Copy source to build container
+          docker run --rm \
+            -v ${{ github.workspace }}:/workspace \
+            -w /workspace \
+            slicer/slicer-base:latest \
+            bash -c "
+              set -e
+              set -x
+              
+              # Copy source to build directory
+              cp -r /workspace /usr/src/Slicer
+              
+              # Run the build
+              /usr/src/Slicer-build/BuildSlicer.sh
+              
+              # Get the package file path
+              package_filepath=\$(head -n1 /usr/src/Slicer-build/Slicer-build/PACKAGE_FILE.txt)
+              echo \"Package filepath: \${package_filepath}\"
+              
+              # Copy package back to workspace
+              cp \${package_filepath} /workspace/
+              
+              # Get package name
+              package=\$(basename \${package_filepath})
+              echo \"Package name: \${package}\"
+              
+              # Write output for next step
+              echo \${package} > /workspace/package_name.txt
+            "
+          
+          # Set output for artifact upload
+          package_name=$(cat package_name.txt)
+          echo "package_name=${package_name}" >> $GITHUB_OUTPUT
+
+      # Upload build artifacts
+      - name: Upload Slicer Package
+        if: steps.slicer-build.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: slicer-package
+          path: ${{ steps.slicer-build.outputs.package_name }}
+          retention-days: 30
+
+      # Upload build logs on failure
+      - name: Upload Build Logs
+        if: failure() && steps.slicer-build.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            build-logs/
+            *.log
+          retention-days: 7
+
+  # Documentation build (if docs have changed)
+  build-docs:
+    name: Build Documentation
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+
+      # Check if documentation files changed
+      - name: Check for documentation changes
+        uses: dorny/paths-filter@v3.0.2
+        id: docs-changes
+        with:
+          filters: |
+            docs:
+              - "Docs/**"
+              - "README.md"
+              - "*.md"
+
+      # Build documentation if changes detected
+      - name: Trigger Documentation Build
+        if: steps.docs-changes.outputs.docs == 'true'
+        run: |
+          echo "Documentation changes detected. Triggering documentation build..."
+          # This would normally trigger a separate documentation workflow
+          # For now, just log that docs would be built
+          echo "::notice ::Documentation build would be triggered here"
+
+  # Notification job
+  notify:
+    name: Notify Build Status
+    runs-on: ubuntu-latest
+    needs: [build-slicer, build-docs]
+    if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - name: Build Status Summary
+        run: |
+          echo "Build Summary:"
+          echo "- Slicer Build: ${{ needs.build-slicer.result }}"
+          echo "- Documentation: ${{ needs.build-docs.result }}"
+          
+          if [[ "${{ needs.build-slicer.result }}" == "success" ]]; then
+            echo "✅ Slicer build completed successfully"
+          elif [[ "${{ needs.build-slicer.result }}" == "failure" ]]; then
+            echo "❌ Slicer build failed"
+            exit 1
+          else
+            echo "⏭️ Slicer build was skipped"
+          fi
