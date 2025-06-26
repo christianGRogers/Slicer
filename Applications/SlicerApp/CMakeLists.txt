@@ -63,6 +63,9 @@ set(APP_SRCS
   Main.cxx
   )
 
+# Disable splash screen during build
+set(SLICERAPP_SPLASHSCREEN_ENABLED FALSE)
+
 slicerMacroBuildApplication(
   NAME ${PROJECT_NAME}
   APPLICATION_NAME ${${PROJECT_NAME}_APPLICATION_NAME}
