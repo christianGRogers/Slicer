@@ -1,0 +1,362 @@
+name: Build Slicer
+
+on:
+  push:
+    branches: [ main, master, develop ]
+  pull_request:
+    branches: [ main, master, develop ]
+  workflow_dispatch:  # Allow manual triggers
+
+env:
+  # Qt version compatible with Slicer
+  QT_VERSION: '5.15.2'
+  # CMake version compatible with Slicer  
+  CMAKE_VERSION: '3.28.3'
+  # Build configuration
+  BUILD_TYPE: Release
+
+jobs:
+  build-windows:
+    runs-on: windows-2022
+    
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: "Windows Release"
+            build_type: Release
+            qt_arch: win64_msvc2019_64
+          # Uncomment for debug builds (requires more time and storage)
+          # - name: "Windows Debug"
+          #   build_type: Debug
+          #   qt_arch: win64_msvc2019_64
+
+    name: ${{ matrix.name }}
+    
+    steps:
+    - name: Checkout Slicer
+      uses: actions/checkout@v4
+      with:
+        repository: Slicer/Slicer
+        path: Slicer
+        fetch-depth: 1
+        
+    - name: Setup Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
+        
+    - name: Setup Visual Studio
+      uses: microsoft/setup-msbuild@v1.3
+      with:
+        vs-version: '17.0'
+        
+    - name: Install CMake
+      uses: lukka/get-cmake@latest
+      with:
+        cmakeVersion: ${{ env.CMAKE_VERSION }}
+        
+    - name: Cache Qt
+      id: cache-qt
+      uses: actions/cache@v3
+      with:
+        path: ../Qt
+        key: ${{ runner.os }}-QtCache-${{ env.QT_VERSION }}-${{ matrix.qt_arch }}
+        
+    - name: Install Qt
+      uses: jurplel/install-qt-action@v3
+      with:
+        version: ${{ env.QT_VERSION }}
+        arch: ${{ matrix.qt_arch }}
+        cached: ${{ steps.cache-qt.outputs.cache-hit }}
+        setup-python: false
+        
+    - name: Setup build directories
+      run: |
+        mkdir -p D:\S
+        mkdir -p D:\SR
+        mkdir -p D:\SD
+      shell: bash
+      
+    - name: Cache Slicer dependencies
+      uses: actions/cache@v3
+      with:
+        path: |
+          D:\SR\*-build
+          D:\SR\*-install
+        key: slicer-deps-${{ runner.os }}-${{ matrix.build_type }}-${{ hashFiles('Slicer/SuperBuild.cmake', 'Slicer/SuperBuild/**') }}
+        restore-keys: |
+          slicer-deps-${{ runner.os }}-${{ matrix.build_type }}-
+          slicer-deps-${{ runner.os }}-
+          
+    - name: Configure Slicer
+      run: |
+        cd D:\
+        cmake `
+          -G "Visual Studio 17 2022" `
+          -A x64 `
+          -DQt5_DIR:PATH="${{ env.Qt5_Dir }}/lib/cmake/Qt5" `
+          -DCMAKE_BUILD_TYPE:STRING=${{ matrix.build_type }} `
+          -DSlicer_USE_PYTHONQT_WITH_TCL:BOOL=OFF `
+          -DSlicer_BUILD_TESTING:BOOL=OFF `
+          -S "${{ github.workspace }}\Slicer" `
+          -B "D:\SR"
+      shell: pwsh
+      
+    - name: Build Slicer
+      run: |
+        cmake --build D:\SR --config ${{ matrix.build_type }} --parallel 2
+      shell: pwsh
+      timeout-minutes: 300  # 5 hours timeout
+      
+    - name: Package Slicer (Release only)
+      if: matrix.build_type == 'Release'
+      run: |
+        cd D:\SR
+        cmake --build . --config Release --target PACKAGE
+      shell: pwsh
+      
+    - name: Upload build artifacts
+      if: matrix.build_type == 'Release'
+      uses: actions/upload-artifact@v3
+      with:
+        name: Slicer-${{ runner.os }}-${{ matrix.build_type }}
+        path: |
+          D:\SR\Slicer-build\Slicer.exe
+          D:\SR\*.exe
+          D:\SR\*.msi
+        retention-days: 30
+        
+    - name: Upload logs on failure
+      if: failure()
+      uses: actions/upload-artifact@v3
+      with:
+        name: build-logs-${{ matrix.name }}
+        path: |
+          D:\SR\**\*.log
+          D:\SR\CMakeFiles\CMakeError.log
+          D:\SR\CMakeFiles\CMakeOutput.log
+        retention-days: 7
+
+  build-linux:
+    runs-on: ubuntu-22.04
+    
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: "Linux Release"
+            build_type: Release
+            
+    name: ${{ matrix.name }}
+    
+    steps:
+    - name: Checkout Slicer
+      uses: actions/checkout@v4
+      with:
+        repository: Slicer/Slicer
+        path: Slicer
+        fetch-depth: 1
+        
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          build-essential \
+          cmake \
+          git \
+          libfontconfig1-dev \
+          libgl1-mesa-dev \
+          libglu1-mesa-dev \
+          libxt-dev \
+          libxrender-dev \
+          libxrandr-dev \
+          libxinerama-dev \
+          libxcursor-dev \
+          libxi-dev \
+          libssl-dev \
+          libnss3-dev \
+          libxss1 \
+          libasound2-dev
+          
+    - name: Setup Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
+        
+    - name: Install CMake
+      uses: lukka/get-cmake@latest
+      with:
+        cmakeVersion: ${{ env.CMAKE_VERSION }}
+        
+    - name: Cache Qt
+      id: cache-qt-linux
+      uses: actions/cache@v3
+      with:
+        path: ../Qt
+        key: ${{ runner.os }}-QtCache-${{ env.QT_VERSION }}-gcc_64
+        
+    - name: Install Qt
+      uses: jurplel/install-qt-action@v3
+      with:
+        version: ${{ env.QT_VERSION }}
+        cached: ${{ steps.cache-qt-linux.outputs.cache-hit }}
+        setup-python: false
+        
+    - name: Setup build directories
+      run: |
+        mkdir -p $HOME/Slicer-build
+        
+    - name: Cache Slicer dependencies
+      uses: actions/cache@v3
+      with:
+        path: |
+          $HOME/Slicer-build/*-build
+          $HOME/Slicer-build/*-install
+        key: slicer-deps-${{ runner.os }}-${{ matrix.build_type }}-${{ hashFiles('Slicer/SuperBuild.cmake', 'Slicer/SuperBuild/**') }}
+        restore-keys: |
+          slicer-deps-${{ runner.os }}-${{ matrix.build_type }}-
+          slicer-deps-${{ runner.os }}-
+          
+    - name: Configure Slicer
+      run: |
+        cmake \
+          -G "Unix Makefiles" \
+          -DCMAKE_BUILD_TYPE:STRING=${{ matrix.build_type }} \
+          -DQt5_DIR:PATH="${{ env.Qt5_Dir }}/lib/cmake/Qt5" \
+          -DSlicer_USE_PYTHONQT_WITH_TCL:BOOL=OFF \
+          -DSlicer_BUILD_TESTING:BOOL=OFF \
+          -S "${{ github.workspace }}/Slicer" \
+          -B "$HOME/Slicer-build"
+          
+    - name: Build Slicer
+      run: |
+        cmake --build $HOME/Slicer-build --config ${{ matrix.build_type }} --parallel $(nproc)
+      timeout-minutes: 300  # 5 hours timeout
+      
+    - name: Package Slicer
+      run: |
+        cd $HOME/Slicer-build
+        cmake --build . --config ${{ matrix.build_type }} --target package
+        
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v3
+      with:
+        name: Slicer-${{ runner.os }}-${{ matrix.build_type }}
+        path: |
+          $HOME/Slicer-build/Slicer-build/Slicer
+          $HOME/Slicer-build/*.tar.gz
+          $HOME/Slicer-build/*.deb
+        retention-days: 30
+        
+    - name: Upload logs on failure
+      if: failure()
+      uses: actions/upload-artifact@v3
+      with:
+        name: build-logs-${{ matrix.name }}
+        path: |
+          $HOME/Slicer-build/**/*.log
+          $HOME/Slicer-build/CMakeFiles/CMakeError.log
+          $HOME/Slicer-build/CMakeFiles/CMakeOutput.log
+        retention-days: 7
+
+  build-macos:
+    runs-on: macos-12
+    
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: "macOS Release"
+            build_type: Release
+            
+    name: ${{ matrix.name }}
+    
+    steps:
+    - name: Checkout Slicer
+      uses: actions/checkout@v4
+      with:
+        repository: Slicer/Slicer
+        path: Slicer
+        fetch-depth: 1
+        
+    - name: Setup Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
+        
+    - name: Install CMake
+      uses: lukka/get-cmake@latest
+      with:
+        cmakeVersion: ${{ env.CMAKE_VERSION }}
+        
+    - name: Cache Qt
+      id: cache-qt-macos
+      uses: actions/cache@v3
+      with:
+        path: ../Qt
+        key: ${{ runner.os }}-QtCache-${{ env.QT_VERSION }}-clang_64
+        
+    - name: Install Qt
+      uses: jurplel/install-qt-action@v3
+      with:
+        version: ${{ env.QT_VERSION }}
+        cached: ${{ steps.cache-qt-macos.outputs.cache-hit }}
+        setup-python: false
+        
+    - name: Setup build directories
+      run: |
+        mkdir -p $HOME/Slicer-build
+        
+    - name: Cache Slicer dependencies
+      uses: actions/cache@v3
+      with:
+        path: |
+          $HOME/Slicer-build/*-build
+          $HOME/Slicer-build/*-install
+        key: slicer-deps-${{ runner.os }}-${{ matrix.build_type }}-${{ hashFiles('Slicer/SuperBuild.cmake', 'Slicer/SuperBuild/**') }}
+        restore-keys: |
+          slicer-deps-${{ runner.os }}-${{ matrix.build_type }}-
+          slicer-deps-${{ runner.os }}-
+          
+    - name: Configure Slicer
+      run: |
+        cmake \
+          -G "Unix Makefiles" \
+          -DCMAKE_BUILD_TYPE:STRING=${{ matrix.build_type }} \
+          -DQt5_DIR:PATH="${{ env.Qt5_Dir }}/lib/cmake/Qt5" \
+          -DSlicer_USE_PYTHONQT_WITH_TCL:BOOL=OFF \
+          -DSlicer_BUILD_TESTING:BOOL=OFF \
+          -DCMAKE_OSX_DEPLOYMENT_TARGET:STRING=10.15 \
+          -S "${{ github.workspace }}/Slicer" \
+          -B "$HOME/Slicer-build"
+          
+    - name: Build Slicer
+      run: |
+        cmake --build $HOME/Slicer-build --config ${{ matrix.build_type }} --parallel $(sysctl -n hw.logicalcpu)
+      timeout-minutes: 300  # 5 hours timeout
+      
+    - name: Package Slicer
+      run: |
+        cd $HOME/Slicer-build
+        cmake --build . --config ${{ matrix.build_type }} --target package
+        
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v3
+      with:
+        name: Slicer-${{ runner.os }}-${{ matrix.build_type }}
+        path: |
+          $HOME/Slicer-build/Slicer-build/Slicer.app
+          $HOME/Slicer-build/*.dmg
+        retention-days: 30
+        
+    - name: Upload logs on failure
+      if: failure()
+      uses: actions/upload-artifact@v3
+      with:
+        name: build-logs-${{ matrix.name }}
+        path: |
+          $HOME/Slicer-build/**/*.log
+          $HOME/Slicer-build/CMakeFiles/CMakeError.log
+          $HOME/Slicer-build/CMakeFiles/CMakeOutput.log
+        retention-days: 7

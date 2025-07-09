@@ -1,0 +1,118 @@
+name: Build Slicer (Simplified)
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:  # Allow manual triggers
+    inputs:
+      build_type:
+        description: 'Build type'
+        required: true
+        default: 'Release'
+        type: choice
+        options:
+        - Release
+        - Debug
+
+env:
+  QT_VERSION: '5.15.2'
+  CMAKE_VERSION: '3.28.3'
+
+jobs:
+  build-slicer-windows:
+    runs-on: windows-2022
+    
+    steps:
+    - name: Checkout this repository
+      uses: actions/checkout@v4
+      
+    - name: Checkout Slicer source
+      uses: actions/checkout@v4
+      with:
+        repository: Slicer/Slicer
+        path: Slicer-source
+        fetch-depth: 1
+        
+    - name: Setup Visual Studio
+      uses: microsoft/setup-msbuild@v1.3
+      with:
+        vs-version: '17.0'
+        
+    - name: Install CMake
+      uses: lukka/get-cmake@latest
+      with:
+        cmakeVersion: ${{ env.CMAKE_VERSION }}
+        
+    - name: Install Qt
+      uses: jurplel/install-qt-action@v3
+      with:
+        version: ${{ env.QT_VERSION }}
+        arch: win64_msvc2019_64
+        setup-python: false
+        
+    - name: Setup build directories
+      run: |
+        New-Item -ItemType Directory -Path "D:\Slicer-build" -Force
+      shell: pwsh
+      
+    - name: Configure Slicer
+      run: |
+        $env:BUILD_TYPE = "${{ github.event.inputs.build_type || 'Release' }}"
+        cmake `
+          -G "Visual Studio 17 2022" `
+          -A x64 `
+          -DQt5_DIR:PATH="${{ env.Qt5_Dir }}/lib/cmake/Qt5" `
+          -DCMAKE_BUILD_TYPE:STRING=$env:BUILD_TYPE `
+          -DSlicer_BUILD_TESTING:BOOL=OFF `
+          -DSlicer_BUILD_DOCUMENTATION:BOOL=OFF `
+          -S "${{ github.workspace }}\Slicer-source" `
+          -B "D:\Slicer-build"
+      shell: pwsh
+      
+    - name: Build Slicer
+      run: |
+        $env:BUILD_TYPE = "${{ github.event.inputs.build_type || 'Release' }}"
+        cmake --build "D:\Slicer-build" --config $env:BUILD_TYPE --parallel 2
+      shell: pwsh
+      timeout-minutes: 360  # 6 hours timeout
+      
+    - name: Create portable package
+      run: |
+        $env:BUILD_TYPE = "${{ github.event.inputs.build_type || 'Release' }}"
+        $BUILD_DIR = "D:\Slicer-build\Slicer-build"
+        $PACKAGE_DIR = "D:\Slicer-package"
+        
+        New-Item -ItemType Directory -Path $PACKAGE_DIR -Force
+        
+        # Copy main executable and required files
+        Copy-Item "$BUILD_DIR\bin\$env:BUILD_TYPE\*" -Destination $PACKAGE_DIR -Recurse -Force
+        Copy-Item "$BUILD_DIR\lib\$env:BUILD_TYPE\*" -Destination "$PACKAGE_DIR\lib" -Recurse -Force -ErrorAction SilentlyContinue
+        
+        # Create a simple launcher script
+        @"
+        @echo off
+        set SLICER_HOME=%~dp0
+        "%SLICER_HOME%SlicerApp-real.exe" %*
+        "@ | Out-File -FilePath "$PACKAGE_DIR\Slicer.bat" -Encoding ASCII
+        
+        # Compress the package
+        Compress-Archive -Path "$PACKAGE_DIR\*" -DestinationPath "D:\Slicer-$env:BUILD_TYPE-Windows.zip"
+      shell: pwsh
+      
+    - name: Upload Slicer package
+      uses: actions/upload-artifact@v3
+      with:
+        name: Slicer-Windows-${{ github.event.inputs.build_type || 'Release' }}
+        path: D:\Slicer-*.zip
+        retention-days: 30
+        
+    - name: Upload build logs on failure
+      if: failure()
+      uses: actions/upload-artifact@v3
+      with:
+        name: build-logs-windows
+        path: |
+          D:\Slicer-build\**\*.log
+          D:\Slicer-build\CMakeFiles\CMakeError.log
+          D:\Slicer-build\CMakeFiles\CMakeOutput.log
+        retention-days: 7
